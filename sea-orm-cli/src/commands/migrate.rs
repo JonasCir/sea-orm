@@ -7,6 +7,10 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote, ToTokens};
+use syn::{Expr, ImplItem, Item, Stmt, Type};
+use crate::commands::{emit_generated_code, read_dir};
 
 use crate::MigrateSubcommands;
 
@@ -18,9 +22,9 @@ pub fn run_migrate_command(
     match command {
         Some(MigrateSubcommands::Init) => run_migrate_init(migration_dir)?,
         Some(MigrateSubcommands::Generate {
-            migration_name,
-            universal_time,
-        }) => run_migrate_generate(migration_dir, &migration_name, universal_time)?,
+                 migration_name,
+                 universal_time,
+             }) => run_migrate_generate(migration_dir, &migration_name, universal_time)?,
         _ => {
             let (subcommand, migration_dir, steps, verbose) = match command {
                 Some(MigrateSubcommands::Fresh) => ("fresh", migration_dir, None, verbose),
@@ -183,43 +187,95 @@ fn get_migrator_filepath(migration_dir: &str) -> PathBuf {
 
 fn update_migrator(migration_name: &str, migration_dir: &str) -> Result<(), Box<dyn Error>> {
     let migrator_filepath = get_migrator_filepath(migration_dir);
+
     println!(
         "Adding migration `{}` to `{}`",
         migration_name,
         migrator_filepath.display()
     );
-    let migrator_content = fs::read_to_string(&migrator_filepath)?;
-    let mut updated_migrator_content = migrator_content.clone();
 
     // create a backup of the migrator file in case something goes wrong
     let migrator_backup_filepath = migrator_filepath.with_extension("rs.bak");
     fs::copy(&migrator_filepath, &migrator_backup_filepath)?;
-    let mut migrator_file = fs::File::create(&migrator_filepath)?;
 
-    // find existing mod declarations, add new line
-    let mod_regex = Regex::new(r"mod\s+(?P<name>m\d{8}_\d{6}_\w+);")?;
-    let mods: Vec<_> = mod_regex.captures_iter(&migrator_content).collect();
-    let mods_end = mods.last().unwrap().get(0).unwrap().end() + 1;
-    updated_migrator_content.insert_str(mods_end, format!("mod {};\n", migration_name).as_str());
+    // parse the current migrator file
+    let migrator_file_content = fs::read_to_string(&migrator_filepath)?;
+    let mut ast = syn::parse_file(&migrator_file_content)?;
 
-    // build new vector from declared migration modules
-    let mut migrations: Vec<&str> = mods
+    // template the new migration module
+    let migration_name_ident = format_ident!("{}", migration_name);
+    let new_mod = quote! {
+        mod #migration_name_ident;
+    };
+
+    // insert migration name after the last mod item in ast
+    let new_mod_index = ast
+        .items
         .iter()
-        .map(|cap| cap.name("name").unwrap().as_str())
-        .collect();
-    migrations.push(migration_name);
-    let mut boxed_migrations = migrations
-        .iter()
-        .map(|migration| format!("            Box::new({}::Migration),", migration))
-        .collect::<Vec<String>>()
-        .join("\n");
-    boxed_migrations.push('\n');
-    let boxed_migrations = format!("vec![\n{}        ]\n", boxed_migrations);
-    let vec_regex = Regex::new(r"vec!\[[\s\S]+\]\n")?;
-    let updated_migrator_content = vec_regex.replace(&updated_migrator_content, &boxed_migrations);
+        .enumerate()
+        .rev()
+        .find_map(|(i, item)| if let Item::Mod(_) = item { Some(i + 1) } else { None })
+        .unwrap_or(0);
+    ast.items.insert(new_mod_index, syn::parse2(new_mod).unwrap());
 
-    migrator_file.write_all(updated_migrator_content.as_bytes())?;
-    fs::remove_file(&migrator_backup_filepath)?;
+    // filter all mods items which match the migration mod regex
+    let mod_regex = Regex::new(r"(?P<name>m\d{8}_\d{6}_\w+)")?;
+    let mut migration_mods: Vec<_> = ast
+        .items
+        .iter()
+        .filter_map(|i| {
+            if let Item::Mod(m) = i {
+                if mod_regex.is_match(&m.ident.to_string()) {
+                    return Some(m.ident.clone());
+                }
+            }
+            return None;
+        }).collect();
+
+    // the module is added, now we need to update the `migrations` vec
+    // first, find the body of the migrations function in the MigratorTrait impl
+    let mut migrations_function = ast
+        .items
+        .iter_mut()
+        // search for the MigratorTrait impl
+        .find_map(|i| {
+            if let Item::Impl(i) = i {
+                if let Some((_, path, _)) = &i.trait_ {
+                    if path.segments.last().unwrap().ident == "MigratorTrait" {
+                        return Some(i);
+                    }
+                }
+            }
+            None
+        })
+        .unwrap()
+        // then search for the migrations function
+        .items
+        .iter_mut()
+        .find_map(|i| {
+            if let ImplItem::Method(m) = i {
+                if m.sig.ident == "migrations" {
+                    return Some(m);
+                }
+            }
+            None
+        }).unwrap();
+
+    // remove the old content of the migrations function
+    migrations_function.block.stmts.clear();
+
+    // template the new body
+    let migrations_body = quote! {
+        vec![
+            #(Box::new(#migration_mods::Migration))*
+        ]
+    };
+
+    let stmt: Expr = syn::parse2(migrations_body).unwrap();
+    migrations_function.block.stmts.push(syn::Stmt::Expr(stmt));
+
+    // write the updated migrator file
+    emit_generated_code( &migrator_filepath, &ast.to_token_stream());
     Ok(())
 }
 
@@ -247,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_update_migrator() {
-        let migration_name = "test_name";
+        let migration_name = "m20220101_000002_test_name";
         let migration_dir = "/tmp/sea_orm_cli_test_update_migrator/";
         fs::create_dir_all(format!("{}src", migration_dir)).unwrap();
         let migrator_filepath = Path::new(migration_dir).join("src").join("lib.rs");
@@ -276,6 +332,50 @@ mod tests {
             *migrations.first().unwrap(),
             "m20220101_000001_create_table"
         );
+        assert_eq!(migrations.last().unwrap(), &migration_name);
+        fs::remove_dir_all("/tmp/sea_orm_cli_test_update_migrator/").unwrap();
+    }
+
+    #[test]
+    fn test_update_migrator_no_mod() {
+        let migration_name = "m20220101_000002_test_name";
+        let migration_dir = "/tmp/sea_orm_cli_test_update_migrator/";
+        fs::create_dir_all(format!("{}src", migration_dir)).unwrap();
+        let migrator_filepath = Path::new(migration_dir).join("src").join("lib.rs");
+        fs::copy("./template/migration/src/lib.rs", &migrator_filepath).unwrap();
+
+        // remove the initial mod declaration and migration
+        let mut lib_rs = fs::read_to_string(&migrator_filepath).unwrap();
+        lib_rs = lib_rs.replace("mod m20220101_000001_create_table;", "");
+        lib_rs = lib_rs.replace(
+            "vec![Box::new(m20220101_000001_create_table::Migration)]",
+            "vec![]",
+        );
+
+        let mut tmp = lib_rs.lines().collect::<Vec<_>>();
+        tmp.remove(1);
+        tmp.remove(2);
+        lib_rs = tmp.join("\n");
+        lib_rs.push('\n');
+        fs::write(&migrator_filepath, lib_rs).unwrap();
+
+
+        update_migrator(migration_name, migration_dir).unwrap();
+        assert!(&migrator_filepath.exists());
+        let migrator_content = fs::read_to_string(&migrator_filepath).unwrap();
+        let mod_regex = Regex::new(r"mod (?P<name>\w+);").unwrap();
+        let migrations: Vec<&str> = mod_regex
+            .captures_iter(&migrator_content)
+            .map(|cap| cap.name("name").unwrap().as_str())
+            .collect();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.last().unwrap(), &migration_name);
+        let boxed_regex = Regex::new(r"Box::new\((?P<name>\S+)::Migration\)").unwrap();
+        let migrations: Vec<&str> = boxed_regex
+            .captures_iter(&migrator_content)
+            .map(|cap| cap.name("name").unwrap().as_str())
+            .collect();
+        assert_eq!(migrations.len(), 1);
         assert_eq!(migrations.last().unwrap(), &migration_name);
         fs::remove_dir_all("/tmp/sea_orm_cli_test_update_migrator/").unwrap();
     }
